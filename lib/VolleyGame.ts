@@ -72,6 +72,7 @@ export class VolleyGame {
   private sendInput: ((data: InputState) => void) | null = null;
   private remoteInput: InputState = { left: false, right: false, jump: false };
   private lastHitTime: number = 0;
+  private serveOffset: number = 0.5;
 
   private inputMap: { [key: string]: boolean } = {};
 
@@ -309,47 +310,32 @@ export class VolleyGame {
       if (this.remoteInput.jump) p2Jump = true;
     } else if (this.mode === 'pvcpu') {
         // Advanced AI
-        // 1. Calculate trajectory if ball is active and moving towards P2 (vx > 0)
-        // 2. Predict landing spot or intercept X
-        
         let targetX = 5; // Default center position
 
         if (this.state.isBallActive) {
-            if (this.state.ball.vx > 0.5) { // Moving towards P2 or already handled by P2 logic?
-                // Actually, if we are in control (hitCount < 3 and lastHitSide == 1), we should plan next move.
-                // Or if incoming (lastHitSide != 1).
+            // Ball is active.
+            // If ball is on my side (x > 0), I generally want to be to the right of it to hit it left.
+            // If ball is on other side, I prepare.
 
-                // Basic Prediction
+            const simDt = 0.016; // Fixed time step for prediction stability
+
+            // If ball is moving towards me (vx > 0) or is already on my side
+            if (this.state.ball.vx > 0.1 || this.state.ball.x > 0) {
+                 // Predict trajectory
                 let simX = this.state.ball.x;
                 let simY = this.state.ball.y;
                 let simVx = this.state.ball.vx;
                 let simVy = this.state.ball.vy;
                 
-                // If I am in control (setting/multi-touch)
-                if (this.state.lastHitSide === 1 && this.state.hitCount < 3) {
-                     // I just hit it.
-                     // If I have hits left, I should move to where it lands to hit it again.
-                     // So I should predict where it lands on MY side.
-                     // But if I hit it over, then I wait.
-                     
-                     // How to know if I hit it over?
-                     // Check if trajectory goes to x < 0.
-                     // If vx < 0, it is going to P1. Return to center.
-                     if (simVx < 0) {
-                         targetX = 5;
-                     } else {
-                         // It's coming back down on my side or going up.
-                         // Predict landing.
-                     }
-                }
-                
-                // Simulate ahead up to 120 frames (2 seconds)
+                let foundIntercept = false;
+
+                // Simulate ahead
                 for (let i = 0; i < 120; i++) {
                     simVy += BALL_GRAVITY;
-                    simX += simVx * dt; 
-                    simY += simVy * dt;
+                    simX += simVx * simDt; 
+                    simY += simVy * simDt;
                     
-                    // Net check (simplified)
+                    // Net check
                     if (Math.abs(simX) < 0.2 && simY < NET_HEIGHT) {
                         simVx *= -0.8;
                     }
@@ -359,62 +345,80 @@ export class VolleyGame {
                         simVx *= -0.8;
                     }
 
-                    // Check if reachable height (e.g. around player height)
-                    if (simX > 0 && simY < 4.0 && simY > 1.0) {
-                        targetX = simX;
-                        // Adjust targetX based on strategy
-                        if (this.state.lastHitSide !== 1) {
-                             // Receiving: Hit Up/Forward. 
-                             // To hit Forward (Left), be on Right.
-                             targetX += 0.3;
-                        } else if (this.state.hitCount === 1) {
-                             // Setting: Hit High/Net.
-                             // To hit high/left, be on right.
-                             targetX += 0.1;
-                        } else {
-                             // Spiking: Hit Down/Left.
-                             // To hit Left/Down? 
-                             // If I jump and hit top of ball -> Down.
-                             // Just hitting Left is enough.
-                             targetX += 0.4;
+                    // Check for interception
+                    // We want to hit it when it's reachable.
+                    // If it's on my side (simX > 0)
+                    if (simX > 0) {
+                        // Priority 1: Hittable in air
+                        if (simY < 4.0 && simY > 1.0) {
+                            targetX = simX;
+                            foundIntercept = true;
+                            break;
                         }
-
-                        break;
+                        // Priority 2: About to hit ground
+                        if (simY < BALL_RADIUS) {
+                            targetX = simX;
+                            foundIntercept = true;
+                            break;
+                        }
                     }
-                    
-                    // Ground check
-                    if (simY < BALL_RADIUS) {
-                         if (simX > 0) targetX = simX;
-                         break;
+                }
+
+                if (foundIntercept) {
+                    // Apply Strategy Offset
+                    if (this.state.lastHitSide !== 1) {
+                         // Receiving: Hit Forward (Left). Be on Right.
+                         targetX += 0.6; // Increased from 0.3 for safety
+                    } else if (this.state.hitCount === 1) {
+                         // Setting: Hit High/Net.
+                         targetX += 0.2;
+                    } else {
+                         // Spiking.
+                         targetX += 0.5;
+                    }
+                } else {
+                    // No intercept found in 2 seconds? 
+                    // Maybe it's looping high or staying on other side.
+                    // If on my side, track x.
+                    if (this.state.ball.x > 0) {
+                        targetX = this.state.ball.x + 0.6;
                     }
                 }
             } else {
-                 // Ball moving away or staying put
-                 if (this.state.lastHitSide === 1 && this.state.ball.vx > -0.1 && this.state.ball.vx < 0.1) {
-                     // It's stationary or moving vertically on my side?
-                     // Go get it.
-                     targetX = this.state.ball.x + 0.1; // Offset to hit left
-                 } else {
-                     // Return to center-ish
-                     targetX = 5;
-                 }
+                 // Ball moving away to P1
+                 targetX = 5;
             }
         } else {
-             // Ball inactive, stay ready
+             // Ball inactive (Serve)
              targetX = 5;
-             // If ball is on my side and inactive, move to it to serve?
+             // If ball is on my side, move to serve position
              if (this.state.ball.x > 0) {
-                 targetX = this.state.ball.x + 0.5; // Stand to RIGHT of ball to hit it LEFT
+                 targetX = this.state.ball.x + this.serveOffset;
              }
         }
 
+        // Clamp targetX to court
+        if (targetX > 10) targetX = 10;
+        if (targetX < 0.5) targetX = 0.5;
+
         // Move towards targetX
+        // Add deadzone to prevent jitter
         if (this.state.p2.x < targetX - 0.2) p2Dir = 1;
         else if (this.state.p2.x > targetX + 0.2) p2Dir = -1;
+        else {
+             // Within deadzone. Stop moving to prevent jitter.
+             // Unless we need to fine tune for serve?
+             // For serve, precision helps.
+             if (!this.state.isBallActive && this.state.ball.x > 0) {
+                  if (this.state.p2.x < targetX - 0.05) p2Dir = 1;
+                  else if (this.state.p2.x > targetX + 0.05) p2Dir = -1;
+             }
+        }
         
         // Jump logic
         // If ball is close and high enough, jump
         if (this.state.isBallActive && this.state.ball.x > 0 && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0 && this.state.ball.y < 5.0 && this.state.ball.y > 2.5) {
+             // Only jump if falling? Or if reachable.
              p2Jump = true;
         } else if (!this.state.isBallActive && this.state.ball.x > 0 && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0) {
              // Serve jump
@@ -597,6 +601,7 @@ export class VolleyGame {
     this.state.isBallActive = false;
     this.state.lastHitSide = 0;
     this.state.hitCount = 0;
+    this.serveOffset = (Math.random() * 2.0) + 0.5; // Random between 0.5 and 2.5
     
     // Reset players too?
     this.state.p1.x = -5;
