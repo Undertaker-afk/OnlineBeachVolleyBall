@@ -28,6 +28,7 @@ interface GameState {
   ball: BallState;
   scoreP1: number;
   scoreP2: number;
+  isBallActive: boolean;
 }
 
 interface InputState {
@@ -37,12 +38,14 @@ interface InputState {
 }
 
 const GRAVITY = -0.5;
-const JUMP_FORCE = 12.0;
+const JUMP_FORCE = 15.0;
 const MOVE_SPEED = 8.0;
 const BALL_GRAVITY = -0.4;
 const NET_HEIGHT = 4.0;
 const PLAYER_RADIUS = 1.0;
-const BALL_RADIUS = 0.5;
+const PLAYER_HEIGHT = 3.5;
+const BALL_RADIUS = 0.8;
+const BALL_SERVE_Y = 6.5;
 
 export class VolleyGame {
   private engine: BABYLON.Engine;
@@ -74,11 +77,12 @@ export class VolleyGame {
     this.engine = new BABYLON.Engine(canvas, true);
     
     this.state = {
-      p1: { x: -5, y: PLAYER_RADIUS, vx: 0, vy: 0 },
-      p2: { x: 5, y: PLAYER_RADIUS, vx: 0, vy: 0 },
-      ball: { x: -5, y: 8, vx: 0, vy: 0 },
+      p1: { x: -5, y: PLAYER_HEIGHT / 2, vx: 0, vy: 0 },
+      p2: { x: 5, y: PLAYER_HEIGHT / 2, vx: 0, vy: 0 },
+      ball: { x: -5, y: BALL_SERVE_Y, vx: 0, vy: 0 },
       scoreP1: 0,
-      scoreP2: 0
+      scoreP2: 0,
+      isBallActive: false
     };
 
     this.scene = this.createScene();
@@ -123,12 +127,12 @@ export class VolleyGame {
     net.material = netMat;
 
     // Players
-    this.p1Mesh = BABYLON.MeshBuilder.CreateCapsule("p1", { radius: PLAYER_RADIUS, height: PLAYER_RADIUS * 2 }, scene);
+    this.p1Mesh = BABYLON.MeshBuilder.CreateCapsule("p1", { radius: PLAYER_RADIUS, height: PLAYER_HEIGHT }, scene);
     const p1Mat = new BABYLON.StandardMaterial("p1Mat", scene);
     p1Mat.diffuseColor = new BABYLON.Color3(1, 0, 0);
     this.p1Mesh.material = p1Mat;
 
-    this.p2Mesh = BABYLON.MeshBuilder.CreateCapsule("p2", { radius: PLAYER_RADIUS, height: PLAYER_RADIUS * 2 }, scene);
+    this.p2Mesh = BABYLON.MeshBuilder.CreateCapsule("p2", { radius: PLAYER_RADIUS, height: PLAYER_HEIGHT }, scene);
     const p2Mat = new BABYLON.StandardMaterial("p2Mat", scene);
     p2Mat.diffuseColor = new BABYLON.Color3(0, 0, 1);
     this.p2Mesh.material = p2Mat;
@@ -262,6 +266,7 @@ export class VolleyGame {
         // Follow ball x
         const targetX = this.state.ball.x;
         // Only move if ball is on P2 side (x > 0)
+        // And check if active! If not active, might want to get closer to serve pos?
         if (this.state.ball.x > 0 || Math.abs(this.state.ball.vx) > 5) {
              if (this.state.p2.x < targetX - 0.5) p2Dir = 1;
              else if (this.state.p2.x > targetX + 0.5) p2Dir = -1;
@@ -272,7 +277,10 @@ export class VolleyGame {
         }
         
         // Jump if ball is close and high
-        if (Math.abs(this.state.p2.x - this.state.ball.x) < 1.0 && this.state.ball.y < 4 && this.state.ball.y > 2) {
+        if (this.state.isBallActive && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0 && this.state.ball.y < 4 && this.state.ball.y > 2) {
+            p2Jump = true;
+        } else if (!this.state.isBallActive && this.state.ball.x > 0 && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0) {
+            // Serve if inactive and on my side
             p2Jump = true;
         }
     }
@@ -292,20 +300,17 @@ export class VolleyGame {
     p.x += p.vx * dt;
     
     // Jump
-    if (jump && p.y <= PLAYER_RADIUS + 0.01) {
+    if (jump && p.y <= PLAYER_HEIGHT / 2 + 0.1) {
       p.vy = JUMP_FORCE;
     }
 
     // Gravity
-    p.vy += GRAVITY; // Per frame update not accurate with dt, need to scale
-    // Fix Gravity to be time based: v = v0 + a*t
-    // p.vy += GRAVITY * (dt * 60); // approximate
-    // Let's just use constant gravity per step for simplicity or adjust
+    p.vy += GRAVITY; 
     p.y += p.vy * dt;
 
     // Ground collision
-    if (p.y < PLAYER_RADIUS) {
-      p.y = PLAYER_RADIUS;
+    if (p.y < PLAYER_HEIGHT / 2) {
+      p.y = PLAYER_HEIGHT / 2;
       p.vy = 0;
     }
 
@@ -321,10 +326,12 @@ export class VolleyGame {
   }
 
   private updateBall(dt: number) {
-    this.state.ball.vy += BALL_GRAVITY; // Gravity
-    
-    this.state.ball.x += this.state.ball.vx * dt;
-    this.state.ball.y += this.state.ball.vy * dt;
+    if (this.state.isBallActive) {
+        this.state.ball.vy += BALL_GRAVITY; // Gravity
+        
+        this.state.ball.x += this.state.ball.vx * dt;
+        this.state.ball.y += this.state.ball.vy * dt;
+    }
 
     // Ground Collision (Score)
     if (this.state.ball.y < BALL_RADIUS) {
@@ -338,11 +345,12 @@ export class VolleyGame {
         this.state.scoreP1++;
         this.resetBall(-1); // Serve to P1
       }
+      return; // Stop processing this frame after reset
     }
 
     // Net Collision
     // Net is Box at 0, height NET_HEIGHT, width 0.2
-    if (Math.abs(this.state.ball.x) < 0.1 + BALL_RADIUS && this.state.ball.y < NET_HEIGHT) {
+    if (this.state.isBallActive && Math.abs(this.state.ball.x) < 0.1 + BALL_RADIUS && this.state.ball.y < NET_HEIGHT) {
       // Hit net
       // Simple bounce x
       this.state.ball.vx *= -0.8;
@@ -350,8 +358,6 @@ export class VolleyGame {
       if (this.state.ball.x < 0) this.state.ball.x = -0.1 - BALL_RADIUS - 0.01;
       else this.state.ball.x = 0.1 + BALL_RADIUS + 0.01;
     }
-
-    // Ceiling? No ceiling in beach volley.
 
     // Wall boundaries (optional)
     if (this.state.ball.x < -12 || this.state.ball.x > 12) {
@@ -366,16 +372,37 @@ export class VolleyGame {
   }
 
   private checkPlayerCollision(p: PlayerState) {
-    const dx = this.state.ball.x - p.x;
+    // Capsule Collision Logic
+    // Segment of player
+    const halfH = PLAYER_HEIGHT / 2;
+    const segHalfLen = halfH - PLAYER_RADIUS; // Length from center to center of caps
+    
+    // Player is vertical. X is p.x. Y range: [p.y - segHalfLen, p.y + segHalfLen]
+    
+    // Find closest point on segment to ball
     const dy = this.state.ball.y - p.y;
-    const dist = Math.sqrt(dx*dx + dy*dy);
+    const clampedDy = Math.max(-segHalfLen, Math.min(segHalfLen, dy));
+    
+    const closestX = p.x;
+    const closestY = p.y + clampedDy;
+    
+    const dx = this.state.ball.x - closestX;
+    const distY = this.state.ball.y - closestY; // Should be same as dy - clampedDy
+    
+    const dist = Math.sqrt(dx*dx + distY*distY);
     const minDist = PLAYER_RADIUS + BALL_RADIUS;
 
     if (dist < minDist) {
       // Collision
+      this.state.isBallActive = true; // Activate ball
+
       // Normalize normal
-      const nx = dx / dist;
-      const ny = dy / dist;
+      let nx = dx / dist;
+      let ny = distY / dist;
+      
+      if (dist === 0) {
+          nx = 0; ny = 1; // Default up if exact overlap
+      }
 
       // Reflect velocity
       // Basic impulse
@@ -394,18 +421,19 @@ export class VolleyGame {
 
   private resetBall(serverSide: number) {
     this.state.ball.x = serverSide * 5;
-    this.state.ball.y = 8;
+    this.state.ball.y = BALL_SERVE_Y;
     this.state.ball.vx = 0;
     this.state.ball.vy = 0;
+    this.state.isBallActive = false;
     
     // Reset players too?
     this.state.p1.x = -5;
-    this.state.p1.y = PLAYER_RADIUS;
+    this.state.p1.y = PLAYER_HEIGHT / 2;
     this.state.p1.vx = 0;
     this.state.p1.vy = 0;
 
     this.state.p2.x = 5;
-    this.state.p2.y = PLAYER_RADIUS;
+    this.state.p2.y = PLAYER_HEIGHT / 2;
     this.state.p2.vx = 0;
     this.state.p2.vy = 0;
   }
