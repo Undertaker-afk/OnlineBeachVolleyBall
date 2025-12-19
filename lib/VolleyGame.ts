@@ -56,8 +56,11 @@ export class VolleyGame {
   private p2Mesh!: BABYLON.Mesh;
   private ballMesh!: BABYLON.Mesh;
   private scoreText!: GUI.TextBlock;
+  private ballSlider!: GUI.Rectangle;
+  private ballSliderMarker!: GUI.Rectangle;
 
   private state: GameState;
+
   private mode: GameMode;
   private role: Role;
   private roomId: string | null;
@@ -152,6 +155,28 @@ export class VolleyGame {
     this.scoreText.top = "-40%";
     advancedTexture.addControl(this.scoreText);
 
+    // Ball Slider UI
+    this.ballSlider = new GUI.Rectangle();
+    this.ballSlider.width = "400px";
+    this.ballSlider.height = "20px";
+    this.ballSlider.cornerRadius = 10;
+    this.ballSlider.color = "white";
+    this.ballSlider.thickness = 2;
+    this.ballSlider.background = "rgba(0,0,0,0.5)";
+    this.ballSlider.verticalAlignment = GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+    this.ballSlider.top = "-20px";
+    advancedTexture.addControl(this.ballSlider);
+
+    this.ballSliderMarker = new GUI.Rectangle();
+    this.ballSliderMarker.width = "20px";
+    this.ballSliderMarker.height = "20px";
+    this.ballSliderMarker.cornerRadius = 10;
+    this.ballSliderMarker.color = "yellow";
+    this.ballSliderMarker.thickness = 0;
+    this.ballSliderMarker.background = "yellow";
+    this.ballSliderMarker.horizontalAlignment = GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+    this.ballSlider.addControl(this.ballSliderMarker);
+
     return scene;
   }
 
@@ -226,6 +251,22 @@ export class VolleyGame {
     this.ballMesh.position.y = this.state.ball.y;
     
     this.scoreText.text = `${this.state.scoreP1} - ${this.state.scoreP2}`;
+
+    // Update Slider
+    // Ball x range is roughly -12 to 12. Slider is 0 to 1.
+    // 0 = -12, 1 = 12 -> 24 width
+    // pos = (x + 12) / 24
+    let sliderPos = (this.state.ball.x + 12) / 24;
+    sliderPos = Math.max(0, Math.min(1, sliderPos));
+    // Slider width is 400px. Marker width is 20px.
+    // Max left is 380px? Or simpler percentage.
+    this.ballSliderMarker.left = `${sliderPos * 100}%`;
+    // We need to account for marker width to center it, but left alignment 0% puts it at left edge.
+    // Let's adjust slightly: left is center of marker? No, default is left edge.
+    // To center marker on value: left = calc(value% - 10px).
+    // GUI doesn't support calc easily in all versions, but let's try pixel offset if possible or just % - %width/2
+    // 20px of 400px is 5%. So subtract 2.5%?
+    this.ballSliderMarker.left = `${(sliderPos * 95)}%`; // Simple approximation
   }
 
   private updatePhysics(dt: number) {
@@ -262,28 +303,95 @@ export class VolleyGame {
       if (this.remoteInput.right) p2Dir = 1;
       if (this.remoteInput.jump) p2Jump = true;
     } else if (this.mode === 'pvcpu') {
-        // Simple AI
-        // Follow ball x
-        const targetX = this.state.ball.x;
-        // Only move if ball is on P2 side (x > 0)
-        // And check if active! If not active, might want to get closer to serve pos?
-        if (this.state.ball.x > 0 || Math.abs(this.state.ball.vx) > 5) {
-             if (this.state.p2.x < targetX - 0.5) p2Dir = 1;
-             else if (this.state.p2.x > targetX + 0.5) p2Dir = -1;
-        } else {
-            // Return to center
-             if (this.state.p2.x < 5) p2Dir = 1;
-             else if (this.state.p2.x > 5) p2Dir = -1;
-        }
+        // Advanced AI
+        // 1. Calculate trajectory if ball is active and moving towards P2 (vx > 0)
+        // 2. Predict landing spot or intercept X
         
-        // Jump if ball is close and high
-        if (this.state.isBallActive && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0 && this.state.ball.y < 4 && this.state.ball.y > 2) {
-            p2Jump = true;
+        let targetX = 5; // Default center position
+
+        if (this.state.isBallActive) {
+            if (this.state.ball.vx > 0.5) { // Moving towards P2
+                // Predict where ball will be at player height
+                const g = BALL_GRAVITY; // Per tick? No, need to scale to seconds. 
+                // Physics update uses dt. GRAVITY in constant is per frame? 
+                // In updateBall: vy += BALL_GRAVITY. This is per frame if we just add it.
+                // But in updateBall we do: vy += BALL_GRAVITY; y += vy * dt;
+                // Wait, if I do vy += G every frame, velocity increases by G every frame.
+                // That depends on frame rate! 
+                // Ideally it should be vy += G * dt.
+                // Looking at updateBall code:
+                // this.state.ball.vy += BALL_GRAVITY;
+                // this.state.ball.x += this.state.ball.vx * dt;
+                // this.state.ball.y += this.state.ball.vy * dt;
+                
+                // This means acceleration is BALL_GRAVITY / dt_frame? 
+                // Actually if code is `vy += G`, then per second it is `G * FPS`.
+                // This is frame-rate dependent physics. Bad practice but exists in current code.
+                // I should fix the physics first or approximate.
+                // Let's assume 60 FPS for calculation or fix the physics.
+                // Current update loop runs via runRenderLoop.
+                
+                // Let's assume for prediction we simulate steps.
+                let simX = this.state.ball.x;
+                let simY = this.state.ball.y;
+                let simVx = this.state.ball.vx;
+                let simVy = this.state.ball.vy;
+                // Simulate ahead up to 120 frames (2 seconds)
+                for (let i = 0; i < 120; i++) {
+                    simVy += BALL_GRAVITY;
+                    simX += simVx * dt; // Using current dt? dt fluctuates.
+                    simY += simVy * dt;
+                    
+                    // Net check (simplified)
+                    if (Math.abs(simX) < 0.2 && simY < NET_HEIGHT) {
+                        simVx *= -0.8;
+                    }
+                    
+                    // Wall check
+                     if (simX < -11 || simX > 11) {
+                        simVx *= -0.8;
+                    }
+
+                    // Check if reachable height (e.g. around player height)
+                    if (simX > 0 && simY < 4.0 && simY > 1.0) {
+                        targetX = simX;
+                        break;
+                    }
+                    
+                    // Ground check
+                    if (simY < BALL_RADIUS) {
+                         if (simX > 0) targetX = simX;
+                         break;
+                    }
+                }
+            } else {
+                 // Ball moving away or staying put
+                 // Return to center-ish
+                 targetX = 5;
+            }
+        } else {
+             // Ball inactive, stay ready
+             targetX = 5;
+             // If ball is on my side and inactive, move to it to serve?
+             if (this.state.ball.x > 0) {
+                 targetX = this.state.ball.x;
+             }
+        }
+
+        // Move towards targetX
+        if (this.state.p2.x < targetX - 0.2) p2Dir = 1;
+        else if (this.state.p2.x > targetX + 0.2) p2Dir = -1;
+        
+        // Jump logic
+        // If ball is close and high enough, jump
+        if (this.state.isBallActive && this.state.ball.x > 0 && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0 && this.state.ball.y < 5.0 && this.state.ball.y > 2.5) {
+             p2Jump = true;
         } else if (!this.state.isBallActive && this.state.ball.x > 0 && Math.abs(this.state.p2.x - this.state.ball.x) < 1.0) {
-            // Serve if inactive and on my side
-            p2Jump = true;
+             // Serve jump
+             p2Jump = true;
         }
     }
+
 
     // Update P1
     this.updatePlayer(this.state.p1, p1Dir, p1Jump, dt, -1);
@@ -360,10 +468,10 @@ export class VolleyGame {
     }
 
     // Wall boundaries (optional)
-    if (this.state.ball.x < -12 || this.state.ball.x > 12) {
+    if (this.state.ball.x < -11 || this.state.ball.x > 11) {
         this.state.ball.vx *= -0.8;
-        if (this.state.ball.x < -12) this.state.ball.x = -12;
-        if (this.state.ball.x > 12) this.state.ball.x = 12;
+        if (this.state.ball.x < -11) this.state.ball.x = -11;
+        if (this.state.ball.x > 11) this.state.ball.x = 11;
     }
 
     // Player Collision
@@ -406,10 +514,11 @@ export class VolleyGame {
 
       // Reflect velocity
       // Basic impulse
-      const strength = 15.0; // Bounce strength
+      const strength = 12.0; // Bounce strength (Slower than 15.0)
       
       // Add player velocity influence
       this.state.ball.vx = nx * strength + p.vx * 0.5;
+
       this.state.ball.vy = ny * strength + p.vy * 0.5 + 5.0; // Add some up force always
 
       // Push ball out
