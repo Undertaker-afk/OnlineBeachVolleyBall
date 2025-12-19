@@ -1,0 +1,420 @@
+import * as BABYLON from '@babylonjs/core';
+import * as GUI from '@babylonjs/gui';
+import { joinRoom } from 'trystero/torrent';
+
+// Define Room type based on joinRoom return type
+type Room = ReturnType<typeof joinRoom>;
+
+export type GameMode = 'local' | 'pvcpu' | 'online';
+export type Role = 'host' | 'client';
+
+interface PlayerState {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+}
+
+interface BallState {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+}
+
+interface GameState {
+  p1: PlayerState;
+  p2: PlayerState;
+  ball: BallState;
+  scoreP1: number;
+  scoreP2: number;
+}
+
+interface InputState {
+    left: boolean;
+    right: boolean;
+    jump: boolean;
+}
+
+const GRAVITY = -0.5;
+const JUMP_FORCE = 12.0;
+const MOVE_SPEED = 8.0;
+const BALL_GRAVITY = -0.4;
+const NET_HEIGHT = 4.0;
+const PLAYER_RADIUS = 1.0;
+const BALL_RADIUS = 0.5;
+
+export class VolleyGame {
+  private engine: BABYLON.Engine;
+  private scene: BABYLON.Scene;
+  private canvas: HTMLCanvasElement;
+
+  private p1Mesh!: BABYLON.Mesh;
+  private p2Mesh!: BABYLON.Mesh;
+  private ballMesh!: BABYLON.Mesh;
+  private scoreText!: GUI.TextBlock;
+
+  private state: GameState;
+  private mode: GameMode;
+  private role: Role;
+  private roomId: string | null;
+
+  private room: Room | null = null;
+  private sendState: ((data: GameState) => void) | null = null;
+  private sendInput: ((data: InputState) => void) | null = null;
+  private remoteInput: InputState = { left: false, right: false, jump: false };
+
+  private inputMap: { [key: string]: boolean } = {};
+
+  constructor(canvas: HTMLCanvasElement, mode: GameMode, role: Role, roomId: string | null) {
+    this.canvas = canvas;
+    this.mode = mode;
+    this.role = role;
+    this.roomId = roomId;
+    this.engine = new BABYLON.Engine(canvas, true);
+    
+    this.state = {
+      p1: { x: -5, y: PLAYER_RADIUS, vx: 0, vy: 0 },
+      p2: { x: 5, y: PLAYER_RADIUS, vx: 0, vy: 0 },
+      ball: { x: -5, y: 8, vx: 0, vy: 0 },
+      scoreP1: 0,
+      scoreP2: 0
+    };
+
+    this.scene = this.createScene();
+    
+    if (this.mode === 'online' && this.roomId) {
+      this.initNetwork();
+    }
+
+    this.setupInputs();
+
+    this.engine.runRenderLoop(() => {
+      this.update();
+      this.scene.render();
+    });
+
+    window.addEventListener('resize', () => {
+      this.engine.resize();
+    });
+  }
+
+  private createScene(): BABYLON.Scene {
+    const scene = new BABYLON.Scene(this.engine);
+    scene.clearColor = new BABYLON.Color4(0.5, 0.8, 1, 1); // Sky blue
+
+    const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 10, -25), scene);
+    camera.setTarget(BABYLON.Vector3.Zero());
+
+    const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+    light.intensity = 0.7;
+
+    // Ground
+    const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 30, height: 10 }, scene);
+    const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+    groundMat.diffuseColor = new BABYLON.Color3(1, 0.9, 0.5); // Sand
+    ground.material = groundMat;
+
+    // Net
+    const net = BABYLON.MeshBuilder.CreateBox("net", { width: 0.2, height: NET_HEIGHT, depth: 10 }, scene);
+    net.position.y = NET_HEIGHT / 2;
+    const netMat = new BABYLON.StandardMaterial("netMat", scene);
+    netMat.diffuseColor = new BABYLON.Color3(0.8, 0.8, 0.8);
+    net.material = netMat;
+
+    // Players
+    this.p1Mesh = BABYLON.MeshBuilder.CreateCapsule("p1", { radius: PLAYER_RADIUS, height: PLAYER_RADIUS * 2 }, scene);
+    const p1Mat = new BABYLON.StandardMaterial("p1Mat", scene);
+    p1Mat.diffuseColor = new BABYLON.Color3(1, 0, 0);
+    this.p1Mesh.material = p1Mat;
+
+    this.p2Mesh = BABYLON.MeshBuilder.CreateCapsule("p2", { radius: PLAYER_RADIUS, height: PLAYER_RADIUS * 2 }, scene);
+    const p2Mat = new BABYLON.StandardMaterial("p2Mat", scene);
+    p2Mat.diffuseColor = new BABYLON.Color3(0, 0, 1);
+    this.p2Mesh.material = p2Mat;
+
+    // Ball
+    this.ballMesh = BABYLON.MeshBuilder.CreateSphere("ball", { diameter: BALL_RADIUS * 2 }, scene);
+    const ballMat = new BABYLON.StandardMaterial("ballMat", scene);
+    ballMat.diffuseColor = new BABYLON.Color3(1, 1, 1);
+    this.ballMesh.material = ballMat;
+
+    // UI
+    const advancedTexture = GUI.AdvancedDynamicTexture.CreateFullscreenUI("UI");
+    this.scoreText = new GUI.TextBlock();
+    this.scoreText.text = "0 - 0";
+    this.scoreText.color = "white";
+    this.scoreText.fontSize = 48;
+    this.scoreText.top = "-40%";
+    advancedTexture.addControl(this.scoreText);
+
+    return scene;
+  }
+
+  private initNetwork() {
+    if (!this.roomId) return;
+    
+    // Trystero
+    this.room = joinRoom({ appId: 'beach-volley-game' }, this.roomId);
+    
+    const [sendState, getState] = this.room.makeAction('state');
+    const [sendInput, getInput] = this.room.makeAction('input');
+    
+    // Cast to correct types
+    this.sendState = sendState as unknown as (data: GameState) => void;
+    this.sendInput = sendInput as unknown as (data: InputState) => void;
+
+    if (this.role === 'client') {
+      getState((data: unknown) => {
+        // Simple reconciliation: just overwrite state for now
+        // Ideally we interpolate
+        this.state = data as GameState;
+      });
+    } else {
+      getInput((data: unknown) => {
+        this.remoteInput = data as InputState;
+      });
+    }
+
+    this.room.onPeerJoin((peerId: string) => {
+      console.log('Peer joined', peerId);
+    });
+  }
+
+  private setupInputs() {
+    window.addEventListener("keydown", (evt) => {
+      this.inputMap[evt.key.toLowerCase()] = true;
+    });
+    window.addEventListener("keyup", (evt) => {
+      this.inputMap[evt.key.toLowerCase()] = false;
+    });
+  }
+
+  private update() {
+    const dt = this.engine.getDeltaTime() / 1000;
+    if (dt > 0.1) return; // Lag spike prevention
+
+    // Game Logic only runs on Host or Local
+    if (this.mode === 'local' || this.mode === 'pvcpu' || (this.mode === 'online' && this.role === 'host')) {
+      this.updatePhysics(dt);
+      
+      // If Host, send state
+      if (this.mode === 'online' && this.sendState) {
+        this.sendState(this.state);
+      }
+    } else if (this.mode === 'online' && this.role === 'client') {
+      // Client sends inputs
+      if (this.sendInput) {
+        // Let's allow client to use AWD or JIL or Arrows
+        const left = this.inputMap['a'] || this.inputMap['j'] || this.inputMap['arrowleft'];
+        const right = this.inputMap['d'] || this.inputMap['l'] || this.inputMap['arrowright'];
+        const jump = this.inputMap['w'] || this.inputMap['i'] || this.inputMap['arrowup'];
+        this.sendInput({ left, right, jump });
+      }
+    }
+
+    // Sync Meshes to State
+    this.p1Mesh.position.x = this.state.p1.x;
+    this.p1Mesh.position.y = this.state.p1.y;
+    this.p2Mesh.position.x = this.state.p2.x;
+    this.p2Mesh.position.y = this.state.p2.y;
+    this.ballMesh.position.x = this.state.ball.x;
+    this.ballMesh.position.y = this.state.ball.y;
+    
+    this.scoreText.text = `${this.state.scoreP1} - ${this.state.scoreP2}`;
+  }
+
+  private updatePhysics(dt: number) {
+    // Player 1 Input
+    let p1Dir = 0;
+    let p1Jump = false;
+
+    if (this.mode === 'local') {
+      if (this.inputMap['a']) p1Dir = -1;
+      if (this.inputMap['d']) p1Dir = 1;
+      if (this.inputMap['w']) p1Jump = true;
+    } else if (this.mode === 'online') {
+      // Host is always P1
+      if (this.inputMap['a']) p1Dir = -1;
+      if (this.inputMap['d']) p1Dir = 1;
+      if (this.inputMap['w']) p1Jump = true;
+    } else if (this.mode === 'pvcpu') {
+        if (this.inputMap['a']) p1Dir = -1;
+        if (this.inputMap['d']) p1Dir = 1;
+        if (this.inputMap['w']) p1Jump = true;
+    }
+
+    // Player 2 Input
+    let p2Dir = 0;
+    let p2Jump = false;
+
+    if (this.mode === 'local') {
+      if (this.inputMap['j']) p2Dir = -1;
+      if (this.inputMap['l']) p2Dir = 1;
+      if (this.inputMap['i']) p2Jump = true;
+    } else if (this.mode === 'online') {
+      // Client is P2
+      if (this.remoteInput.left) p2Dir = -1;
+      if (this.remoteInput.right) p2Dir = 1;
+      if (this.remoteInput.jump) p2Jump = true;
+    } else if (this.mode === 'pvcpu') {
+        // Simple AI
+        // Follow ball x
+        const targetX = this.state.ball.x;
+        // Only move if ball is on P2 side (x > 0)
+        if (this.state.ball.x > 0 || Math.abs(this.state.ball.vx) > 5) {
+             if (this.state.p2.x < targetX - 0.5) p2Dir = 1;
+             else if (this.state.p2.x > targetX + 0.5) p2Dir = -1;
+        } else {
+            // Return to center
+             if (this.state.p2.x < 5) p2Dir = 1;
+             else if (this.state.p2.x > 5) p2Dir = -1;
+        }
+        
+        // Jump if ball is close and high
+        if (Math.abs(this.state.p2.x - this.state.ball.x) < 1.0 && this.state.ball.y < 4 && this.state.ball.y > 2) {
+            p2Jump = true;
+        }
+    }
+
+    // Update P1
+    this.updatePlayer(this.state.p1, p1Dir, p1Jump, dt, -1);
+    // Update P2
+    this.updatePlayer(this.state.p2, p2Dir, p2Jump, dt, 1);
+
+    // Update Ball
+    this.updateBall(dt);
+  }
+
+  private updatePlayer(p: PlayerState, dir: number, jump: boolean, dt: number, side: number) {
+    // Movement
+    p.vx = dir * MOVE_SPEED;
+    p.x += p.vx * dt;
+    
+    // Jump
+    if (jump && p.y <= PLAYER_RADIUS + 0.01) {
+      p.vy = JUMP_FORCE;
+    }
+
+    // Gravity
+    p.vy += GRAVITY; // Per frame update not accurate with dt, need to scale
+    // Fix Gravity to be time based: v = v0 + a*t
+    // p.vy += GRAVITY * (dt * 60); // approximate
+    // Let's just use constant gravity per step for simplicity or adjust
+    p.y += p.vy * dt;
+
+    // Ground collision
+    if (p.y < PLAYER_RADIUS) {
+      p.y = PLAYER_RADIUS;
+      p.vy = 0;
+    }
+
+    // Net collision / Court boundaries
+    // P1 is left (-10 to 0), P2 is right (0 to 10)
+    if (side === -1) {
+      if (p.x > -0.5) p.x = -0.5; // Net at 0
+      if (p.x < -10) p.x = -10;
+    } else {
+      if (p.x < 0.5) p.x = 0.5;
+      if (p.x > 10) p.x = 10;
+    }
+  }
+
+  private updateBall(dt: number) {
+    this.state.ball.vy += BALL_GRAVITY; // Gravity
+    
+    this.state.ball.x += this.state.ball.vx * dt;
+    this.state.ball.y += this.state.ball.vy * dt;
+
+    // Ground Collision (Score)
+    if (this.state.ball.y < BALL_RADIUS) {
+      // Bounce or Score
+      // If it hits ground, score.
+      // Left side = P2 Point, Right side = P1 Point
+      if (this.state.ball.x < 0) {
+        this.state.scoreP2++;
+        this.resetBall(1); // Serve to P2
+      } else {
+        this.state.scoreP1++;
+        this.resetBall(-1); // Serve to P1
+      }
+    }
+
+    // Net Collision
+    // Net is Box at 0, height NET_HEIGHT, width 0.2
+    if (Math.abs(this.state.ball.x) < 0.1 + BALL_RADIUS && this.state.ball.y < NET_HEIGHT) {
+      // Hit net
+      // Simple bounce x
+      this.state.ball.vx *= -0.8;
+      // Push out
+      if (this.state.ball.x < 0) this.state.ball.x = -0.1 - BALL_RADIUS - 0.01;
+      else this.state.ball.x = 0.1 + BALL_RADIUS + 0.01;
+    }
+
+    // Ceiling? No ceiling in beach volley.
+
+    // Wall boundaries (optional)
+    if (this.state.ball.x < -12 || this.state.ball.x > 12) {
+        this.state.ball.vx *= -0.8;
+        if (this.state.ball.x < -12) this.state.ball.x = -12;
+        if (this.state.ball.x > 12) this.state.ball.x = 12;
+    }
+
+    // Player Collision
+    this.checkPlayerCollision(this.state.p1);
+    this.checkPlayerCollision(this.state.p2);
+  }
+
+  private checkPlayerCollision(p: PlayerState) {
+    const dx = this.state.ball.x - p.x;
+    const dy = this.state.ball.y - p.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const minDist = PLAYER_RADIUS + BALL_RADIUS;
+
+    if (dist < minDist) {
+      // Collision
+      // Normalize normal
+      const nx = dx / dist;
+      const ny = dy / dist;
+
+      // Reflect velocity
+      // Basic impulse
+      const strength = 15.0; // Bounce strength
+      
+      // Add player velocity influence
+      this.state.ball.vx = nx * strength + p.vx * 0.5;
+      this.state.ball.vy = ny * strength + p.vy * 0.5 + 5.0; // Add some up force always
+
+      // Push ball out
+      const push = minDist - dist + 0.01;
+      this.state.ball.x += nx * push;
+      this.state.ball.y += ny * push;
+    }
+  }
+
+  private resetBall(serverSide: number) {
+    this.state.ball.x = serverSide * 5;
+    this.state.ball.y = 8;
+    this.state.ball.vx = 0;
+    this.state.ball.vy = 0;
+    
+    // Reset players too?
+    this.state.p1.x = -5;
+    this.state.p1.y = PLAYER_RADIUS;
+    this.state.p1.vx = 0;
+    this.state.p1.vy = 0;
+
+    this.state.p2.x = 5;
+    this.state.p2.y = PLAYER_RADIUS;
+    this.state.p2.vx = 0;
+    this.state.p2.vy = 0;
+  }
+
+  public dispose() {
+    this.engine.dispose();
+    if (this.room) {
+      this.room.leave();
+    }
+    // Remove listeners
+  }
+}
