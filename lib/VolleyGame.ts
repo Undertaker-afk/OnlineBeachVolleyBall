@@ -29,6 +29,8 @@ interface GameState {
   scoreP1: number;
   scoreP2: number;
   isBallActive: boolean;
+  lastHitSide: number; // -1, 1, or 0
+  hitCount: number;
 }
 
 interface InputState {
@@ -69,6 +71,7 @@ export class VolleyGame {
   private sendState: ((data: GameState) => void) | null = null;
   private sendInput: ((data: InputState) => void) | null = null;
   private remoteInput: InputState = { left: false, right: false, jump: false };
+  private lastHitTime: number = 0;
 
   private inputMap: { [key: string]: boolean } = {};
 
@@ -85,7 +88,9 @@ export class VolleyGame {
       ball: { x: -5, y: BALL_SERVE_Y, vx: 0, vy: 0 },
       scoreP1: 0,
       scoreP2: 0,
-      isBallActive: false
+      isBallActive: false,
+      lastHitSide: 0,
+      hitCount: 0
     };
 
     this.scene = this.createScene();
@@ -310,36 +315,38 @@ export class VolleyGame {
         let targetX = 5; // Default center position
 
         if (this.state.isBallActive) {
-            if (this.state.ball.vx > 0.5) { // Moving towards P2
-                // Predict where ball will be at player height
-                const g = BALL_GRAVITY; // Per tick? No, need to scale to seconds. 
-                // Physics update uses dt. GRAVITY in constant is per frame? 
-                // In updateBall: vy += BALL_GRAVITY. This is per frame if we just add it.
-                // But in updateBall we do: vy += BALL_GRAVITY; y += vy * dt;
-                // Wait, if I do vy += G every frame, velocity increases by G every frame.
-                // That depends on frame rate! 
-                // Ideally it should be vy += G * dt.
-                // Looking at updateBall code:
-                // this.state.ball.vy += BALL_GRAVITY;
-                // this.state.ball.x += this.state.ball.vx * dt;
-                // this.state.ball.y += this.state.ball.vy * dt;
-                
-                // This means acceleration is BALL_GRAVITY / dt_frame? 
-                // Actually if code is `vy += G`, then per second it is `G * FPS`.
-                // This is frame-rate dependent physics. Bad practice but exists in current code.
-                // I should fix the physics first or approximate.
-                // Let's assume 60 FPS for calculation or fix the physics.
-                // Current update loop runs via runRenderLoop.
-                
-                // Let's assume for prediction we simulate steps.
+            if (this.state.ball.vx > 0.5) { // Moving towards P2 or already handled by P2 logic?
+                // Actually, if we are in control (hitCount < 3 and lastHitSide == 1), we should plan next move.
+                // Or if incoming (lastHitSide != 1).
+
+                // Basic Prediction
                 let simX = this.state.ball.x;
                 let simY = this.state.ball.y;
                 let simVx = this.state.ball.vx;
                 let simVy = this.state.ball.vy;
+                
+                // If I am in control (setting/multi-touch)
+                if (this.state.lastHitSide === 1 && this.state.hitCount < 3) {
+                     // I just hit it.
+                     // If I have hits left, I should move to where it lands to hit it again.
+                     // So I should predict where it lands on MY side.
+                     // But if I hit it over, then I wait.
+                     
+                     // How to know if I hit it over?
+                     // Check if trajectory goes to x < 0.
+                     // If vx < 0, it is going to P1. Return to center.
+                     if (simVx < 0) {
+                         targetX = 5;
+                     } else {
+                         // It's coming back down on my side or going up.
+                         // Predict landing.
+                     }
+                }
+                
                 // Simulate ahead up to 120 frames (2 seconds)
                 for (let i = 0; i < 120; i++) {
                     simVy += BALL_GRAVITY;
-                    simX += simVx * dt; // Using current dt? dt fluctuates.
+                    simX += simVx * dt; 
                     simY += simVy * dt;
                     
                     // Net check (simplified)
@@ -355,6 +362,23 @@ export class VolleyGame {
                     // Check if reachable height (e.g. around player height)
                     if (simX > 0 && simY < 4.0 && simY > 1.0) {
                         targetX = simX;
+                        // Adjust targetX based on strategy
+                        if (this.state.lastHitSide !== 1) {
+                             // Receiving: Hit Up/Forward. 
+                             // To hit Forward (Left), be on Right.
+                             targetX += 0.3;
+                        } else if (this.state.hitCount === 1) {
+                             // Setting: Hit High/Net.
+                             // To hit high/left, be on right.
+                             targetX += 0.1;
+                        } else {
+                             // Spiking: Hit Down/Left.
+                             // To hit Left/Down? 
+                             // If I jump and hit top of ball -> Down.
+                             // Just hitting Left is enough.
+                             targetX += 0.4;
+                        }
+
                         break;
                     }
                     
@@ -366,15 +390,21 @@ export class VolleyGame {
                 }
             } else {
                  // Ball moving away or staying put
-                 // Return to center-ish
-                 targetX = 5;
+                 if (this.state.lastHitSide === 1 && this.state.ball.vx > -0.1 && this.state.ball.vx < 0.1) {
+                     // It's stationary or moving vertically on my side?
+                     // Go get it.
+                     targetX = this.state.ball.x + 0.1; // Offset to hit left
+                 } else {
+                     // Return to center-ish
+                     targetX = 5;
+                 }
             }
         } else {
              // Ball inactive, stay ready
              targetX = 5;
              // If ball is on my side and inactive, move to it to serve?
              if (this.state.ball.x > 0) {
-                 targetX = this.state.ball.x;
+                 targetX = this.state.ball.x + 0.5; // Stand to RIGHT of ball to hit it LEFT
              }
         }
 
@@ -475,11 +505,11 @@ export class VolleyGame {
     }
 
     // Player Collision
-    this.checkPlayerCollision(this.state.p1);
-    this.checkPlayerCollision(this.state.p2);
+    this.checkPlayerCollision(this.state.p1, -1);
+    this.checkPlayerCollision(this.state.p2, 1);
   }
 
-  private checkPlayerCollision(p: PlayerState) {
+  private checkPlayerCollision(p: PlayerState, side: number) {
     // Capsule Collision Logic
     // Segment of player
     const halfH = PLAYER_HEIGHT / 2;
@@ -502,7 +532,38 @@ export class VolleyGame {
 
     if (dist < minDist) {
       // Collision
+
+      // Check for debounce
+      const now = Date.now();
+      if (now - this.lastHitTime < 300) { // 300ms debounce
+          // Just push out, no hit logic?
+          // Or just allow physics but don't count hit?
+          // If we allow physics, it might look like double hit.
+          // Let's just return to avoid glitchy repeated collisions.
+          return;
+      }
+      this.lastHitTime = now;
+
       this.state.isBallActive = true; // Activate ball
+
+      // Hit Counting
+      if (this.state.lastHitSide === side) {
+          this.state.hitCount++;
+          if (this.state.hitCount > 3) {
+              // Fault!
+              if (side === -1) {
+                  this.state.scoreP2++;
+                  this.resetBall(1);
+              } else {
+                  this.state.scoreP1++;
+                  this.resetBall(-1);
+              }
+              return;
+          }
+      } else {
+          this.state.lastHitSide = side;
+          this.state.hitCount = 1;
+      }
 
       // Normalize normal
       let nx = dx / dist;
@@ -534,6 +595,8 @@ export class VolleyGame {
     this.state.ball.vx = 0;
     this.state.ball.vy = 0;
     this.state.isBallActive = false;
+    this.state.lastHitSide = 0;
+    this.state.hitCount = 0;
     
     // Reset players too?
     this.state.p1.x = -5;
